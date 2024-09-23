@@ -14,50 +14,62 @@ import pyzed.sl as sl
 from dynamixel.active_cam import DynamixelAgent
 from multiprocessing import Array, Process, shared_memory, Queue, Manager, Event, Semaphore
 
+# 设置分辨率和裁剪大小
 resolution = (720, 1280)
 crop_size_w = 1
 crop_size_h = 0
 resolution_cropped = (resolution[0] - crop_size_h, resolution[1] - 2 * crop_size_w)
 
+# 初始化Dynamixel代理
 agent = DynamixelAgent(port="/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FT8IT033-if00-port0")
 agent._robot.set_torque_mode(True)
 
-# Create a Camera object
+# 创建ZED相机对象
 zed = sl.Camera()
 
-# Create a InitParameters object and set configuration parameters
+# 创建初始化参数对象并设置配置参数
 init_params = sl.InitParameters()
 init_params.camera_resolution = sl.RESOLUTION.HD720  # Use HD720 opr HD1200 video mode, depending on camera type.
 init_params.camera_fps = 60  # Set fps at 60
 
-# Open the camera
+# 打开相机
 err = zed.open(init_params)
 if err != sl.ERROR_CODE.SUCCESS:
     print("Camera Open : " + repr(err) + ". Exit program.")
     exit()
 
-# Capture 50 frames and stop
+# 初始化变量
 i = 0
 image_left = sl.Mat()
 image_right = sl.Mat()
 runtime_parameters = sl.RuntimeParameters()
 
+# 设置图像形状和大小
 img_shape = (resolution_cropped[0], 2 * resolution_cropped[1], 3)
 img_height, img_width = resolution_cropped[:2]
+
+# 创建共享内存
 shm = shared_memory.SharedMemory(create=True, size=np.prod(img_shape) * np.uint8().itemsize)
 img_array = np.ndarray((img_shape[0], img_shape[1], 3), dtype=np.uint8, buffer=shm.buf)
+
+# 创建图像队列和切换流媒体的事件
 image_queue = Queue()
 toggle_streaming = Event()
+
+# 初始化OpenTeleVision
 tv = OpenTeleVision(resolution_cropped, shm.name, image_queue, toggle_streaming)
 
+# 主循环
 while True:
     start = time.time()
 
+    # 获取头部矩阵并进行坐标系转换
     head_mat = grd_yup2grd_zup[:3, :3] @ tv.head_matrix[:3, :3] @ grd_yup2grd_zup[:3, :3].T
     if np.sum(head_mat) == 0:
         head_mat = np.eye(3)
     head_rot = rotations.quaternion_from_matrix(head_mat[0:3, 0:3])
     try:
+        # 计算欧拉角并控制机器人关节
         ypr = rotations.euler_from_quaternion(head_rot, 2, 1, 0, False)
         # print(ypr)
         # agent._robot.command_joint_state([0., 0.4])
@@ -68,6 +80,7 @@ while True:
         # exit()
         pass
 
+    # 获取ZED相机图像
     if zed.grab(runtime_parameters) == sl.ERROR_CODE.SUCCESS:
         zed.retrieve_image(image_left, sl.VIEW.LEFT)
         zed.retrieve_image(image_right, sl.VIEW.RIGHT)
@@ -75,12 +88,16 @@ while True:
         # print("Image resolution: {0} x {1} || Image timestamp: {2}\n".format(image.get_width(), image.get_height(),
         #         timestamp.get_milliseconds()))
 
+    # 处理图像
     bgr = np.hstack((image_left.numpy()[crop_size_h:, crop_size_w:-crop_size_w],
                      image_right.numpy()[crop_size_h:, crop_size_w:-crop_size_w]))
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGRA2RGB)
 
+    # 将处理后的图像复制到共享内存
     np.copyto(img_array, rgb)
 
     end = time.time()
     # print(1/(end-start))
+
+# 关闭ZED相机
 zed.close()

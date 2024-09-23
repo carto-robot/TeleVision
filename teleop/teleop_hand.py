@@ -18,23 +18,32 @@ import time
 import yaml
 from multiprocessing import Array, Process, shared_memory, Queue, Manager, Event, Semaphore
 
+#VuerTeleop类负责处理VR输入数据
 class VuerTeleop:
     def __init__(self, config_file_path):
+        # 设置分辨率和裁剪大小
         self.resolution = (720, 1280)
         self.crop_size_w = 0
         self.crop_size_h = 0
         self.resolution_cropped = (self.resolution[0]-self.crop_size_h, self.resolution[1]-2*self.crop_size_w)
 
+        # 设置图像形状和尺寸
         self.img_shape = (self.resolution_cropped[0], 2 * self.resolution_cropped[1], 3)
         self.img_height, self.img_width = self.resolution_cropped[:2]
 
+        # 创建共享内存用于图像传输
         self.shm = shared_memory.SharedMemory(create=True, size=np.prod(self.img_shape) * np.uint8().itemsize)
         self.img_array = np.ndarray((self.img_shape[0], self.img_shape[1], 3), dtype=np.uint8, buffer=self.shm.buf)
+        
+        # 创建图像队列和切换流媒体的事件
         image_queue = Queue()
         toggle_streaming = Event()
+        
+        # 初始化OpenTeleVision和VuerPreprocessor
         self.tv = OpenTeleVision(self.resolution_cropped, self.shm.name, image_queue, toggle_streaming)
         self.processor = VuerPreprocessor()
 
+        # 加载重定向配置
         RetargetingConfig.set_default_urdf_dir('../assets')
         with Path(config_file_path).open('r') as f:
             cfg = yaml.safe_load(f)
@@ -44,14 +53,21 @@ class VuerTeleop:
         self.right_retargeting = right_retargeting_config.build()
 
     def step(self):
+        # 处理输入数据
         head_mat, left_wrist_mat, right_wrist_mat, left_hand_mat, right_hand_mat = self.processor.process(self.tv)
 
+        # 提取头部旋转矩阵
         head_rmat = head_mat[:3, :3]
 
+        # 计算左右手的位姿
+        # 高级索引（Advanced Indexing）特性，具体来说是整数数组索引（Integer Array Indexing）。
+        # 这是NumPy数组的一个强大功能，允许我们使用整数数组来选择和重排数组元素。
         left_pose = np.concatenate([left_wrist_mat[:3, 3] + np.array([-0.6, 0, 1.6]),
                                     rotations.quaternion_from_matrix(left_wrist_mat[:3, :3])[[1, 2, 3, 0]]])
         right_pose = np.concatenate([right_wrist_mat[:3, 3] + np.array([-0.6, 0, 1.6]),
                                      rotations.quaternion_from_matrix(right_wrist_mat[:3, :3])[[1, 2, 3, 0]]])
+        
+        # 重定向左右手的关节角度
         left_qpos = self.left_retargeting.retarget(left_hand_mat[tip_indices])[[4, 5, 6, 7, 10, 11, 8, 9, 0, 1, 2, 3]]
         right_qpos = self.right_retargeting.retarget(right_hand_mat[tip_indices])[[4, 5, 6, 7, 10, 11, 8, 9, 0, 1, 2, 3]]
 
@@ -67,21 +83,47 @@ class Sim:
 
         # configure sim
         sim_params = gymapi.SimParams()
+        #dt is the time increment of the simulation.
+        # Every time you step the simulation via gym.simulate(...) 
+        # you more the sim forward in time by dt.
         sim_params.dt = 1 / 60
+        #The substep is how many slices this dt is split into in order to do the simulation. 
+        # The more substeps, the finer the slicing of time and the greater the accuracy of the simulation, but the more computationally intensive it becomes
         sim_params.substeps = 2
         sim_params.up_axis = gymapi.UP_AXIS_Z
         sim_params.gravity = gymapi.Vec3(0.0, 0.0, -9.81)
+
         sim_params.physx.solver_type = 1
+        #迭代次数越多，模拟的精度越高，但计算成本也越大。
+        #迭代次数较少可能导致一些细微的穿模或不稳定，但能提高模拟速度。
         sim_params.physx.num_position_iterations = 4
         sim_params.physx.num_velocity_iterations = 1
+        #max_gpu_contact_pairs：这个参数定义了GPU可以处理的最大碰撞接触对的数量。
+        #对于手部模拟来说，这个值可能有点过高，因为手指之间的接触对数量通常不会那么多
         sim_params.physx.max_gpu_contact_pairs = 8388608
+        #物理引擎用来确定何时开始生成接触点的距离阈值。
+        #如果发现物体似乎在实际接触之前就开始相互作用，可以尝试减小这个值。
+        #如果模拟运行缓慢，可以考虑略微增加这个值来提高性能
         sim_params.physx.contact_offset = 0.002
+        
+        # 设置摩擦力开始生效的距离阈值
+        # 当两个物体表面之间的距离小于此值时，摩擦力开始计算
+        # 较小的值可能会导致更精确的摩擦模拟，但也可能增加计算负担
         sim_params.physx.friction_offset_threshold = 0.001
+
+        # 设置摩擦力相关性距离
+        # 这个参数影响摩擦力的平滑度和连续性
+        # 较小的值可能会导致更精确的摩擦模拟，但可能会增加不稳定性
         sim_params.physx.friction_correlation_distance = 0.0005
+        # rest_offset 参数定义了物体在静止状态下的偏移距离
+        # 当设置为 0.0 时，物体在静止时不会有额外的偏移
+        # 这有助于提高模拟的精确度，但可能会增加计算负担
+        # 如果遇到性能问题，可以考虑稍微增加这个值
         sim_params.physx.rest_offset = 0.0
         sim_params.physx.use_gpu = True
         sim_params.use_gpu_pipeline = False
 
+        #gym.create_sim(compute_device_id, graphics_device_id, gymapi.SIM_PHYSX, sim_params)
         self.sim = self.gym.create_sim(0, 0, gymapi.SIM_PHYSX, sim_params)
         if self.sim is None:
             print("*** Failed to create sim")
@@ -257,9 +299,13 @@ if __name__ == '__main__':
 
     try:
         while True:
+            # 获取遥操作输入
             head_rmat, left_pose, right_pose, left_qpos, right_qpos = teleoperator.step()
+            # 更新仿真并获取图像
             left_img, right_img = simulator.step(head_rmat, left_pose, right_pose, left_qpos, right_qpos)
+            # 将图像复制到共享内存
             np.copyto(teleoperator.img_array, np.hstack((left_img, right_img)))
     except KeyboardInterrupt:
         simulator.end()
         exit(0)
+
